@@ -1,0 +1,10 @@
+{
+  "description": "This platform enhances student learning through personalized diagnostics, targeted practice, and progress tracking, empowering learners, parents, and teachers.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

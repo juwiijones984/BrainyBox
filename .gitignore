@@ -1,0 +1,31 @@
+node_modules/
+dist/
+build/
+.idea/
+.cache/
+.env*
+.vite/
+
+# Firebase service-account keys. These are project-level admin credentials:
+# one that is committed grants full read/write over Firestore, Storage and Auth
+# to anyone who clones the repo, and it bypasses every rule in firestore.rules
+# and storage.rules. Never commit one — supply it through
+# GOOGLE_APPLICATION_CREDENTIALS, and rotate the key if it was ever pushed.
+*-firebase-adminsdk-*.json
+*service-account*.json
+serviceAccountKey.json
+vite.config.*.timestamp-*
+*.tsbuildinfo
+*-debug.log*
+logs/
+*.log
+.claude-replay.*
+.tmp-*
+/.figma/design-context/
+
+# Platform-managed agentplat state, not project source. In the
+# client-initiated single-repo workspace layout (make's `Path: "."` spec) the
+# repo root IS the workspace root, so these land inside this repo rather than
+# beside it.
+/.plugins/
+/.opencode-skills/

@@ -1,0 +1,344 @@
+rules_version = '2';
+
+// ── Authorisation ──────────────────────────────────────────────────────────
+//
+// Every decision below reads documents through `get()` and `exists()`, which
+// are trusted server-side reads. A browser console that patches its own state
+// still fails here, because the client never supplies the answer.
+//
+// The three relationships that let one account see another's data are:
+//   enrolment   classes/{classId}/members/{uid}
+//   guardianship parentLinks/{parentUid}__{childUid}
+//   teaching    teacherUids on the learner's profile
+//
+// All three are operator-written and operator-only. That is the load-bearing
+// part of this file: if an account could create its own enrolment or parent
+// link, it could grant itself access to anyone, and no rule below would be able
+// to stop it. The web client has no code path that writes any of the three —
+// see `src/lib/firebase/store.ts`, where `addMember` and `linkParentToChild`
+// exist for the provisioning script and are not reachable from a page.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function myUid() {
+      return request.auth.uid;
+    }
+
+    /**
+     * Elevated privileges, backed by a custom claim.
+     *
+     * A custom claim can only be set by the Admin SDK or the Firebase console,
+     * never by the web client. This is how rosters and parent links get
+     * provisioned: `firebase auth:override` or an Admin SDK call, not a page.
+     */
+    function isAdmin() {
+      return signedIn() && request.auth.token.admin == true;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && myUid() == uid;
+    }
+
+    function userDoc(uid) {
+      return get(/databases/$(database)/documents/users/$(uid));
+    }
+
+    function userExists(uid) {
+      return signedIn() && exists(/databases/$(database)/documents/users/$(uid));
+    }
+
+    /** The caller's own role, or null when they have no profile yet. */
+    function myRole() {
+      return userExists(myUid()) ? userDoc(myUid()).data.role : null;
+    }
+
+    /** Roles a person may hold. */
+    function isKnownRole(role) {
+      return role == 'learner' || role == 'parent' || role == 'teacher';
+    }
+
+    /**
+     * True when the caller teaches the given learner.
+     *
+     * `teacherUids` is denormalised onto the learner's profile by the same
+     * operator action that writes the class membership, because a rule has no
+     * way to ask "is this learner in any class I teach?" — that would be a
+     * query, and rules evaluate per document. The trade-off is that the two
+     * records can drift, so the provisioning script writes both together; the
+     * alternative (a collection group) cannot be expressed here at all.
+     */
+    function teachesLearner(uid) {
+      return myRole() == 'teacher'
+        && userExists(uid)
+        && myUid() in userDoc(uid).data.teacherUids;
+    }
+
+    /**
+     * The id of one guardianship link.
+     *
+     * The `__` separator is built here rather than written inline as
+     * `.../parentLinks/$(myUid())__$(uid)`: a path segment may not mix an
+     * interpolation with trailing literal text, so that form does not compile.
+     * Interpolating a single computed string does.
+     */
+    function parentLinkId(parentUid, childUid) {
+      return parentUid + '__' + childUid;
+    }
+
+    /** True when the caller is a guardian of the given child. */
+    function isLinkedParentOf(uid) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/parentLinks/$(parentLinkId(myUid(), uid)));
+    }
+
+    /** May this account see the given learner's profile and progress? */
+    function canViewLearner(uid) {
+      return isSelf(uid) || isAdmin() || isLinkedParentOf(uid) || teachesLearner(uid);
+    }
+
+    // ── Profiles ───────────────────────────────────────────────────────────
+    //
+    // Readable by the owner, a linked guardian, or a teacher of theirs — the
+    // minimum set that lets the three portals render a name at all.
+
+    match /users/{uid} {
+
+      allow read: if canViewLearner(uid);
+
+      // Self-registration. The role must be one the app lets a person declare
+      // themselves, which is `isKnownRole` — `admin` is deliberately absent,
+      // because admin is a custom claim on the ID token and only the Admin SDK
+      // can mint one. No `role` value grants it.
+      //
+      // Declaring `parent` or `teacher` here grants nothing on its own, and that
+      // is what makes it safe to allow. Every cross-account read below is gated on
+      // an operator-written relationship: a new "teacher" owns no classes, so
+      // `isClassTeacher()` is false and their rosters are empty; a new "parent" has
+      // no `parentLinks` document, so `isLinkedParentOf()` is false and they see no
+      // child. They reach their portal and find nothing until an administrator
+      // links them up, which is correct — not a bug to tighten later.
+      //
+      // The cost of allowing it, and the reason it was once narrower, is that
+      // `users` can now contain accounts labelled parent or teacher that hold
+      // neither a class nor a child. Anything counting or listing accounts reports
+      // declared intent rather than reality. The blast-radius argument still
+      // stands for any future change: the fewer accounts that may set an arbitrary
+      // role, the smaller the cost of a mistake in a rule that pairs a role check
+      // with a relationship check.
+      //
+      // `grade` is meaningful only for a learner: a learner must supply an integer
+      // grade, and a parent or teacher must leave it null, so a profile cannot
+      // imply someone in Grade 11 is also a parent of a Grade 12 class. Both
+      // branches are required — written as `role != 'learner' || grade is int ||
+      // grade == null` the first disjunct is true for every non-learner and the
+      // expression short-circuits, leaving `grade` entirely unrestricted for
+      // parents and teachers. Operator writes via `scripts/provision.ts setrole`
+      // go through the Admin SDK and bypass this rule entirely.
+      allow create: if isSelf(uid)
+        && isKnownRole(request.resource.data.role)
+        && ((request.resource.data.role == 'learner'
+             && request.resource.data.grade is int)
+            || (request.resource.data.role != 'learner'
+                && request.resource.data.grade == null));
+
+      // Self-service edits only. `role`, `createdAt` and `teacherUids` are not
+      // in the allowed set, so a learner cannot promote themselves or grant
+      // themselves a teacher by editing their own profile — that is the single
+      // most important rule on this profile.
+      //
+      // `grade` is writable, but only by a learner: it is in the allowed set
+      // unconditionally below, which would otherwise let a parent or teacher set
+      // a grade after registration and break the invariant the create rule
+      // enforces.
+      allow update: if isSelf(uid)
+        && isKnownRole(resource.data.role)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['name', 'grade', 'subjects', 'avatar', 'streak', 'lastStudyDate'])
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['grade'])
+            || (resource.data.role == 'learner'
+                && request.resource.data.grade is int));
+
+// The `teacherUids` mirror is operator-written, and only an operator may
+      // write it. Enrolment through the admin portal writes the membership and this
+      // mirror in one batch, so without this branch a learner enrolled from the UI
+      // satisfied `isClassMember` (and looked right in the roster) while the teacher
+      // could still read none of their data.
+      //
+      // There is deliberately no teacher branch here. A rule on `users/{uid}` cannot
+      // ask "is this learner in a class I teach?" - that is a query over
+      // `classes/{classId}/members`, and rules evaluate one document at a time with
+      // no way to enumerate the caller's classes. The narrow version that was tried -
+      // letting a teacher change only their own entry, proved by comparing
+      // `teacherUids.removeAll([myUid()])` on both sides - looked constrained and was
+      // not: it compares the list *after* removing the caller, so a teacher writing
+      // `[myUid()]` onto any profile passes it, granting themselves access to a
+      // learner they were never enrolled to teach. The comparison constrains which
+      // *other* entries may change, never which document may be written.
+      //
+      // So the invariant at the top of this file holds: enrolment is an operator
+      // action, and a class teacher cannot reach the mirror at all.
+      allow update: if request.resource.data.diff(resource.data).affectedKeys().hasOnly(['teacherUids'])
+        && isAdmin();
+
+      allow delete: if isSelf(uid) || isAdmin();
+
+      // ── Learner-owned collections ───────────────────────────────────────
+      //
+      // Read and write are separated deliberately throughout this block. A
+      // guardian and a teacher are allowed to *read* a learner's history — that
+      // is the entire point of the parent and teacher portals — but never to
+      // *write* it. A mark that a teacher could insert, or a revision tick a
+      // parent could set, would be a score no attempt produced.
+
+      // Attempt history is what the parent portal renders as session count and
+      // last activity, and what the teacher roster sorts on.
+      match /attempts/{attemptId} {
+        allow read: if canViewLearner(uid);
+        allow write, delete: if isSelf(uid) || isAdmin();
+      }
+
+      // The saved revision plan. Read cross-account for the same reason as
+      // attempts; only the learner ticks items off.
+      match /revision/{itemId} {
+        allow read: if canViewLearner(uid);
+        allow write, delete: if isSelf(uid) || isAdmin();
+      }
+
+      // Imported question banks and invented custom skills stay private to
+      // their owner. A parent portal shows progress, never the material, and a
+      // teacher's job is not to edit a learner's bank. These were previously
+      // unmatched and therefore denied outright, which broke `AppStore` load
+      // for every signed-in learner.
+      match /questions/{questionId} {
+        allow read, write, delete: if isSelf(uid) || isAdmin();
+      }
+
+      match /skills/{skillId} {
+        allow read, write, delete: if isSelf(uid) || isAdmin();
+      }
+
+      // Quiz results, including completed attempts. Private to the owner: this
+      // is a record of what the learner submitted, not a view of their progress.
+      match /quizzes/{quizId} {
+        allow read, write, delete: if isSelf(uid) || isAdmin();
+      }
+
+      // Resource descriptors mirror the uploaded files, so read access is the
+      // same audience as `storage.rules`. Writes are not: the descriptor names
+      // the Storage object, so allowing a guardian to write it would let them
+      // point a learner's library entry at an object path of their choosing.
+      match /resources/{resourceId} {
+        allow read: if canViewLearner(uid);
+        allow write, delete: if isSelf(uid) || isAdmin();
+      }
+    }
+
+    // ── Mastery ────────────────────────────────────────────────────────────
+    //
+    // The evidence a Marks Map is built from. Writable only by the learner who
+    // earned it: a teacher's job is to read the gap, not to fill it. Anything
+    // else would let a mark appear that no attempt produced.
+    //
+    // A missing document is the honest state for a skill nobody has attempted.
+    // It is not a record scoring zero, and the UI does not render it as one.
+
+    match /learners/{uid}/mastery/{skillId} {
+      allow read: if canViewLearner(uid);
+      allow write, delete: if isSelf(uid) || isAdmin();
+    }
+
+    // ── Classes ────────────────────────────────────────────────────────────
+    //
+    // A class and its roster are provisioned by an operator. There is no
+    // in-app class management, deliberately: letting any account create a class
+    // and enrol arbitrary uids into it would turn every roster read into a way
+    // to inspect other learners' marks.
+
+    match /classes/{classId} {
+
+      function isClassTeacher() {
+        return signedIn() && exists(/databases/$(database)/documents/classes/$(classId))
+          && userDoc(myUid()).data.role == 'teacher'
+          && get(/databases/$(database)/documents/classes/$(classId)).data.teacherUid == myUid();
+      }
+
+      function isClassMember() {
+        return signedIn()
+          && exists(/databases/$(database)/documents/classes/$(classId)/members/$(myUid()));
+      }
+
+      allow read: if isAdmin() || isClassTeacher() || isClassMember();
+
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || isClassTeacher();
+
+      // Enrolment is an operator action, and it is the only thing that writes the
+      // `teacherUids` mirror - which is the only thing that grants a teacher access
+      // to a learner's data. A class teacher may still correct an enrolment's display
+      // name or role, but creating one is admin-only: allowing it would let any
+      // teacher put an account on their own roster, and a roster entry is a claim
+      // about a real relationship that only an operator can make.
+      match /members/{memberUid} {
+        allow read: if isAdmin()
+          || isClassTeacher()
+          || isSelf(memberUid)
+          || isLinkedParentOf(memberUid);
+
+        // `uid` must agree with the document id, so a member cannot be filed
+        // under someone else's id to slip past the checks above. This is
+        // enforced on update as well as create: a class teacher is allowed to
+        // correct a display name or role, but must not be able to rewrite the
+        // identity field and move the enrolment onto another account.
+        allow create: if isAdmin()
+          && request.resource.data.uid == memberUid
+          && isKnownRole(request.resource.data.role);
+
+        allow update: if (isAdmin() || isClassTeacher())
+          && request.resource.data.uid == memberUid
+          && isKnownRole(request.resource.data.role);
+
+        allow delete: if isAdmin();
+      }
+    }
+
+    // ── Guardianship ───────────────────────────────────────────────────────
+    //
+    // `parentLinks/{parentUid}__{childUid}` is the only thing that lets one
+    // account read another's progress, so it is operator-only. Both named
+    // parties can read the link: a learner can see who is watching their marks,
+    // and an operator can read it to audit who has access.
+
+    match /parentLinks/{linkId} {
+      // Authorised on the *fields* alone, never on `linkId`.
+      //
+      // A parent listing their children queries `where('parentUid', '==', myUid())`,
+      // which constrains a field but not the wildcard document id. Any conjunct
+      // naming `linkId` is then evaluated against a variable Firestore cannot bind
+      // from the query, so the whole rule fails and the list is rejected — which is
+      // how this read worked: the query was denied and the parent portal never
+      // discovered a linked child. Field-only disjuncts are provable from a
+      // constrained query, so the query is authorised while a single unconstrained
+      // read still requires every conjunct to hold.
+      allow read: if isAdmin()
+        || resource.data.parentUid == myUid()
+        || resource.data.childUid == myUid();
+
+      allow create, delete: if isAdmin();
+      // Links are established and revoked, never edited: an update would let a
+      // link be redirected from one child to another without a new decision.
+      allow update: if false;
+    }
+
+    // Anything not named above is closed. Adding a collection without a rule
+    // fails loudly, which is the behaviour we want.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

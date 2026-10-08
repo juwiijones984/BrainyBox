@@ -1,0 +1,5 @@
+{
+  "//": "Composite indexes are only needed for queries that combine an equality filter with an orderBy or a range. Every query in src/lib/firebase/store.ts is a single-field filter or a single-field order, all of which Firestore serves from automatic single-field indexes.",
+  "indexes": [],
+  "fieldOverrides": []
+}

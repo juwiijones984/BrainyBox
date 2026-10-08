@@ -1,0 +1,113 @@
+rules_version = '2';
+
+// ── Cloud Storage ──────────────────────────────────────────────────────────
+//
+// Mirrors the Firestore rules for the one place bytes are stored:
+// `users/{uid}/resources/{resourceId}`.
+//
+// A resource is readable by its owner, by a linked guardian, and by a teacher
+// of that learner — the same audience `users/{uid}/resources/{resourceId}` in
+// `firestore.rules` allows, so the file and its descriptor never disagree about
+// who can see them.
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function myUid() {
+      return request.auth.uid;
+    }
+
+    function isAdmin() {
+      return signedIn() && request.auth.token.admin == true;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && myUid() == uid;
+    }
+
+    // ── Cross-service lookups ──────────────────────────────────────────────
+    //
+    // Cloud Storage rules cannot use Firestore's `get()`/`exists()`: those walk
+    // a `/databases/{database}/documents/...` path that does not exist in a
+    // bucket. Firestore documents are reached through the `firestore` namespace
+    // instead, which is the difference between these rules compiling and being
+    // rejected at deploy time.
+    //
+    // `firestore.get` fails closed: a missing document makes the whole
+    // expression false rather than raising an error, which is what we want for
+    // an unprovisioned account.
+
+    function userDoc(uid) {
+      return firestore.get(/databases/(default)/documents/users/$(uid));
+    }
+
+    function userExists(uid) {
+      return firestore.exists(/databases/(default)/documents/users/$(uid));
+    }
+
+    /**
+     * The id of one guardianship link, matching `paths.parentLink` in
+     * `src/lib/firebase/store.ts` and `parentLinkId` in `firestore.rules`.
+     *
+     * The `__` separator cannot be written inline as
+     * `parentLinks/$(parentUid)__$(childUid)`: a path segment may not mix an
+     * interpolation with trailing literal text. Interpolating one computed
+     * string compiles.
+     */
+    function parentLinkId(parentUid, childUid) {
+      return parentUid + '__' + childUid;
+    }
+
+    function parentLinkExists(parentUid, childUid) {
+      return firestore.exists(
+        /databases/(default)/documents/parentLinks/$(parentLinkId(parentUid, childUid))
+      );
+    }
+
+    function myRole() {
+      return userExists(myUid()) ? userDoc(myUid()).data.role : null;
+    }
+
+    function isLinkedParentOf(uid) {
+      return signedIn() && parentLinkExists(myUid(), uid);
+    }
+
+    function teachesLearner(uid) {
+      return myRole() == 'teacher'
+        && userExists(uid)
+        && myUid() in userDoc(uid).data.teacherUids;
+    }
+
+    function canViewLearner(uid) {
+      return isSelf(uid) || isAdmin() || isLinkedParentOf(uid) || teachesLearner(uid);
+    }
+
+    match /users/{uid}/resources/{allPaths=**} {
+      allow read: if canViewLearner(uid);
+
+    // Uploads and metadata updates are the owner's only. `request.resource.size`
+    // keeps a single file from becoming an unbounded bill, and the MIME allowlist
+    // keeps the bucket from being used as general file hosting. Uploads are
+    // streamed by `src/lib/firebase/uploads.ts`, which also records a real
+    // content type so downloads open rather than arriving as an unknown blob.
+    //
+    // These are split from delete on purpose: `allow write` covers deletion too,
+    // and on a delete `request.resource` is null, so reading `.size` off it
+    // errors and the rule denies. A learner must be able to remove their own
+    // file — that is what the "clear my data" control calls.
+    allow create, update: if isSelf(uid)
+      && request.resource.size < 20 * 1024 * 1024
+      && request.resource.contentType.matches('image/.*|application/pdf|text/.*|audio/.*|video/.*|application/(msword|vnd\\.openxmlformats-officedocument\\.wordprocessingml\\.document|ms-excel|vnd\\.openxmlformats-officedocument\\.spreadsheetml\\.sheet|json)');
+
+    allow delete: if isSelf(uid) || isAdmin();
+    }
+
+    // No other bucket path is writable or readable.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
