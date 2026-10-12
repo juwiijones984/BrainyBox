@@ -4,8 +4,10 @@ import {
   type Attempt, type Question, type Quiz, type SubjectId,
 } from '@/data'
 import { localDay, newId } from '@/lib/storage'
+import { clearSession, readSession, sessionMatches, writeSession } from '@/lib/session'
 import { Button, Pill, ProgressBar, ScoreChip, difficultyColor } from '@/components/ui'
 import { useAppStore } from '@/store/AppStore'
+import { useAuth } from '@/store/AuthStore'
 
 export interface QuizRunResult {
   results: boolean[]
@@ -81,10 +83,16 @@ function normaliseAnswer(value: string): string {
     .replace(/[,;.]+$/g, '')
 }
 
+/** Identifies the exact paper on screen, so a save is never applied to another. */
+const sessionSignature = (quizId: string, questions: Question[]): string =>
+  `${quizId}|${questions.map(q => q.id).join(',')}`
+
 export default function QuizRunner({
   quiz, questions, mode, onFinish, onExit, footer,
 }: QuizRunnerProps) {
   const { recordAttempt } = useAppStore()
+  const { user } = useAuth()
+  const uid = user?.uid ?? null
   const kind = mode ?? quiz.kind
   // Practice gives instant feedback; anything with a clock is exam-style and
   // must not reveal answers until submission.
@@ -103,8 +111,38 @@ export default function QuizRunner({
   const [timeLeft, setTimeLeft] = useState(timeLimitSec ?? 0)
   const startedAt = useRef(Date.now())
   const finished = useRef(false)
+  // The paper the reset effect below has already seeded. It is deliberately a
+  // ref, not state: the persistence effect has to compare against it in the same
+  // commit, before React re-renders with the restored answers.
+  const seededSig = useRef('')
 
   const question = questions[index]
+
+  // ── Resume ────────────────────────────────────────────────────────────────
+  //
+  // Declared before the seeding effect on purpose. On a mount that is about to
+  // restore a stored session, React runs this effect first, with the pre-restore
+  // state — the guard against `seededSig` stops it writing empty answers over
+  // the very session the next effect is about to load.
+  useEffect(() => {
+    if (!uid || revealed || finished.current) return
+    if (seededSig.current !== sessionSignature(quiz.id, questions)) return
+    writeSession(uid, {
+      quizId: quiz.id,
+      quizTitle: quiz.title,
+      subjectId: quiz.subjectId,
+      kind,
+      skillId: quiz.id.startsWith('skill-') ? quiz.id.slice('skill-'.length) : null,
+      questionIds: questions.map(q => q.id),
+      answers,
+      textAnswers,
+      checked,
+      index,
+      elapsedSec: Math.max(0, Math.round((Date.now() - startedAt.current) / 1000)),
+      timeLeftSec: timeLimitSec === null ? null : timeLeft,
+      savedAt: Date.now(),
+    })
+  }, [uid, revealed, quiz.id, quiz.title, quiz.subjectId, kind, questions, answers, textAnswers, checked, index, timeLeft, timeLimitSec])
   // Marks come from the questions actually being asked, not the seed bank —
   // an imported paper's questions are not in the static data.
   const marksAvailable = useMemo(
@@ -133,17 +171,37 @@ export default function QuizRunner({
   // Run state is seeded from `questions` once. A different set of questions —
   // a different quiz on the same route — would otherwise leave the old answers,
   // the old `results` indices and a possibly out-of-range `index` in place.
+  //
+  // Where a stored session exists for this exact question set, it is restored
+  // instead of starting fresh, so a paper survives leaving the page.
   useEffect(() => {
-    setAnswers(questions.map(() => null))
-    setTextAnswers(questions.map(() => ''))
-    setChecked(questions.map(() => false))
-    setIndex(0)
+    const ids = questions.map(q => q.id)
+    const stored = readSession(uid)
+    const resumable = sessionMatches(stored, quiz.id, ids) ? stored : null
+
+    if (resumable) {
+      setAnswers(resumable.answers)
+      setTextAnswers(resumable.textAnswers)
+      setChecked(resumable.checked)
+      setIndex(Math.min(Math.max(0, resumable.index), Math.max(0, questions.length - 1)))
+      setTimeLeft(resumable.timeLeftSec ?? timeLimitSec ?? 0)
+      // Continue the clock from the time already spent rather than restarting it,
+      // so a resumed paper's recorded duration describes the whole sitting.
+      startedAt.current = Date.now() - resumable.elapsedSec * 1000
+    } else {
+      setAnswers(questions.map(() => null))
+      setTextAnswers(questions.map(() => ''))
+      setChecked(questions.map(() => false))
+      setIndex(0)
+      setTimeLeft(timeLimitSec ?? 0)
+      startedAt.current = Date.now()
+    }
+
     setRevealed(false)
     setSaveError(false)
-    setTimeLeft(timeLimitSec ?? 0)
-    startedAt.current = Date.now()
     finished.current = false
-  }, [questions, timeLimitSec])
+    seededSig.current = sessionSignature(quiz.id, questions)
+  }, [questions, timeLimitSec, quiz.id, uid])
 
   // ── Grading ──────────────────────────────────────────────────────────────
   const isCorrect = useCallback(
@@ -193,8 +251,13 @@ export default function QuizRunner({
       console.error('Could not save attempt', error)
     })
 
+    // The sitting is finished, so there is nothing left to resume. Clearing it
+    // here rather than on exit means an abandoned paper keeps its resume point
+    // while a submitted one does not.
+    if (uid) clearSession(uid)
+
     onFinish?.({ results, durationSec, timeLeftSec: timeLimitSec === null ? null : timeLeft })
-  }, [finished, grade, quiz, kind, timeLimitSec, timeLeft, recordAttempt, onFinish])
+  }, [finished, grade, quiz, kind, timeLimitSec, timeLeft, recordAttempt, onFinish, uid])
 
   // Auto-submit the moment the clock runs out.
   useEffect(() => {

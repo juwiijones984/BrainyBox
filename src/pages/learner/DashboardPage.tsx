@@ -1,70 +1,190 @@
 import { useMemo } from 'react'
 import { useNavigate } from 'react-router'
 import {
-  SUBJECT_MAP, attemptAverageOf, getMasteryLevel, isSkillDrillId, masteryColor,
-  subjectAverageOf, subjectQuestions, subjectTopics, topicAverageOf, topicAveragesOf,
-  weakestSkills,
+  SUBJECT_MAP, getMasteryLevel, lessonForSkill, masteryColor, masteryCoverage,
+  subjectAverageOf, weakestSkills,
+  type AssessmentKind, type Question, type Quiz, type RevisionItem, type SkillProgress,
 } from '@/data'
 import { useAppStore } from '@/store/AppStore'
 import { useAuth } from '@/store/AuthStore'
+import { readSession, resumePath, type SavedSession } from '@/lib/session'
 import {
-  Card, DeltaBadge, EmptyState, MasteryDot, NotAssessed, Pill, ProgressBar, ScoreChip,
+  Button, Card, DeltaBadge, EmptyState, MasteryBadge, Pill, ProgressBar, ScoreChip,
   SectionLabel, StatTile,
 } from '@/components/ui'
 import LessonLinkButton from '@/components/lessons/LessonLinkButton'
 
+const KIND_LABEL: Record<AssessmentKind, string> = {
+  diagnostic: 'Diagnostic',
+  practice: 'Practice',
+  quiz: 'Quiz',
+  test: 'Test',
+  exam: 'Exam',
+}
+
+const PLAN_STYLE: Record<RevisionItem['type'], { glyph: string; label: string; bg: string; color: string }> = {
+  practice: { glyph: '◉', label: 'Practice', bg: 'rgba(16,185,129,0.12)', color: '#047857' },
+  lesson: { glyph: '◈', label: 'Lesson', bg: 'rgba(2,127,196,0.12)', color: '#014E8C' },
+  'mini-test': { glyph: '⏱', label: 'Mini-test', bg: 'rgba(244,63,94,0.12)', color: '#f43f5e' },
+  revision: { glyph: '◷', label: 'Revision', bg: 'rgba(245,158,11,0.12)', color: '#B45309' },
+}
+
+/** Where a planned activity actually opens. */
+function planTarget(item: RevisionItem): string {
+  if (item.type === 'lesson') {
+    const lesson = lessonForSkill(item.skillId)
+    if (lesson) return `/learner/lessons/${lesson.moduleNumber}/skill/${item.skillId}`
+  }
+  return `/learner/practice/session/${item.skillId}`
+}
+
+/** A stored session only counts if it still points at content the learner has. */
+function sessionIsValid(
+  session: SavedSession,
+  quizzes: Quiz[],
+  skills: SkillProgress[],
+  questions: Question[],
+): boolean {
+  if (session.skillId) {
+    return skills.some(s => s.id === session.skillId)
+      && questions.some(q => q.skillId === session.skillId)
+  }
+  return quizzes.some(q => q.id === session.quizId)
+}
+
 export default function DashboardPage() {
   const navigate = useNavigate()
-  const { activeSubjectId, skills, quizzes, attempts, resources, status, needsDiagnostic } = useAppStore()
-  const { profile } = useAuth()
+  const { activeSubjectId, skills, quizzes, questions, attempts, revision, status } = useAppStore()
+  const { profile, user } = useAuth()
 
   const subject = SUBJECT_MAP[activeSubjectId]
   const accent = subject.color
 
+  // Device state, read once per mount: the paper the learner left unfinished.
+  const storedSession = useMemo(() => readSession(user?.uid ?? null), [user?.uid])
+
   const view = useMemo(() => {
-    const subjectSkillList = skills.filter(s => s.subjectId === activeSubjectId)
-    const topics = subjectTopics(activeSubjectId)
-    const questions = subjectQuestions(activeSubjectId)
-
-    // Weakest and strongest are chosen from measured skills only. A brand-new
-    // learner has neither, and the page says so instead of inventing a focus.
-    const weakest = weakestSkills(subjectSkillList, 1)[0] ?? null
-    const rankedTopics = topicAveragesOf(skills, activeSubjectId)
-    const strongestTopic = rankedTopics.length ? rankedTopics[rankedTopics.length - 1] : null
-
+    const subjectSkills = skills.filter(s => s.subjectId === activeSubjectId)
     const subjectAttempts = attempts.filter(a => a.subjectId === activeSubjectId)
-    const minutes = subjectAttempts.reduce((sum, a) => sum + a.durationMin, 0)
-    const accuracy = attemptAverageOf(subjectAttempts)
 
-    // Recommend the shortest unattempted diagnostic first. A 10-question module
-    // diagnostic gives a usable signal in minutes, where the full baseline is
-    // better once the learner knows the short one has not caught everything.
-    const unattempted = quizzes.filter(
-      q => q.subjectId === activeSubjectId && !subjectAttempts.some(a => a.quizId === q.id),
-    )
-    const nextQuiz = [...unattempted].sort((a, b) => {
-      const kindWeight = (q: typeof a) => (q.kind === 'diagnostic' ? 0 : 1)
-      return kindWeight(a) - kindWeight(b) || a.questionIds.length - b.questionIds.length
-    })[0] ?? quizzes.find(q => q.subjectId === activeSubjectId)
+    const hasQuestions = (skill: SkillProgress) => questions.some(q => q.skillId === skill.id)
+    const weak = weakestSkills(subjectSkills, 3)
+    const unassessed = subjectSkills.filter(s => s.current === null)
 
-    const assessed = subjectSkillList.filter(s => s.current !== null).length
+    const diagnosticQuiz =
+      quizzes
+        .filter(q => q.subjectId === activeSubjectId && q.kind === 'diagnostic')
+        .sort((a, b) => a.questionIds.length - b.questionIds.length)[0] ?? null
 
     return {
-      skills: subjectSkillList, topics, questions, weakest, strongestTopic,
-      minutes, accuracy, subjectAttempts, nextQuiz, assessed,
-      subjectResources: resources.filter(r => r.subjectId === activeSubjectId),
+      subjectSkills,
+      coverage: masteryCoverage(subjectSkills),
+      baseline: subjectAverageOf(skills, activeSubjectId, 'baseline'),
+      current: subjectAverageOf(skills, activeSubjectId),
+      minutes: subjectAttempts.reduce((sum, a) => sum + a.durationMin, 0),
+      sessions: subjectAttempts.length,
+      weak,
+      unassessed,
+      // A weak skill with no questions cannot be drilled, so practice goes to it
+      // only when the bank can actually answer for it.
+      practiceTarget: weak.find(hasQuestions) ?? subjectSkills.filter(hasQuestions)[0] ?? null,
+      diagnosticQuiz,
+      plan: revision.filter(item => item.subjectId === activeSubjectId).slice(0, 3),
+      session:
+        storedSession && sessionIsValid(storedSession, quizzes, skills, questions)
+          ? storedSession
+          : null,
     }
-  }, [skills, quizzes, attempts, resources, activeSubjectId])
+  }, [skills, quizzes, questions, attempts, revision, activeSubjectId, storedSession])
 
-  const now = subjectAverageOf(skills, activeSubjectId)
-  const base = subjectAverageOf(skills, activeSubjectId, 'baseline')
-  const level = getMasteryLevel(now)
+  // The single most useful next action, in priority order: finish what is
+  // already started, establish a baseline, then work the weakest measured skill.
+  const nextStep = useMemo(() => {
+    const { session, coverage, diagnosticQuiz, practiceTarget } = view
+
+    if (session) {
+      const total = session.questionIds.length
+      return {
+        cta: 'Continue Learning',
+        title: session.quizTitle,
+        topic: SUBJECT_MAP[session.subjectId].name,
+        why: 'You started this and have not finished it yet, so resuming is the quickest way back into real work.',
+        activityType: KIND_LABEL[session.kind],
+        duration: `Question ${Math.min(session.index + 1, total)} of ${total}`,
+        href: resumePath(session),
+      }
+    }
+
+    if (coverage.assessed === 0 && diagnosticQuiz) {
+      return {
+        cta: 'Take Diagnostic',
+        title: diagnosticQuiz.title,
+        topic: subject.name,
+        why: `Nothing has been measured in ${subject.name} yet, so your progress, plan and focus areas have no evidence to build from.`,
+        activityType: 'Diagnostic',
+        duration: diagnosticQuiz.timeLimitMin
+          ? `${diagnosticQuiz.timeLimitMin} min`
+          : `${diagnosticQuiz.questionIds.length} questions · untimed`,
+        href: `/learner/tests/${diagnosticQuiz.id}`,
+      }
+    }
+
+    if (practiceTarget) {
+      const count = questions.filter(q => q.skillId === practiceTarget.id).length
+      const measured = practiceTarget.current !== null
+      return {
+        cta: 'Start Practice',
+        title: practiceTarget.name,
+        topic: practiceTarget.topic,
+        why: measured
+          ? `${practiceTarget.name} is your lowest measured skill at ${practiceTarget.current}%, so it is holding your ${subject.name} average back the most.`
+          : `${practiceTarget.name} is the next ${subject.name} skill with questions ready, so it is where practice starts.`,
+        activityType: 'Skill practice',
+        duration: count
+          ? `≈ ${count} min · ${count} question${count === 1 ? '' : 's'}`
+          : 'No questions yet',
+        href: `/learner/practice/session/${practiceTarget.id}`,
+      }
+    }
+
+    if (diagnosticQuiz) {
+      return {
+        cta: 'Take Diagnostic',
+        title: diagnosticQuiz.title,
+        topic: subject.name,
+        why: `A diagnostic would give your ${subject.name} progress and plan a real starting point.`,
+        activityType: 'Diagnostic',
+        duration: diagnosticQuiz.timeLimitMin
+          ? `${diagnosticQuiz.timeLimitMin} min`
+          : `${diagnosticQuiz.questionIds.length} questions`,
+        href: `/learner/tests/${diagnosticQuiz.id}`,
+      }
+    }
+
+    return null
+  }, [view, subject.name, questions])
 
   const hour = new Date().getHours()
   const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening'
   const firstName = profile?.name.split(' ')[0]
 
-  if (!view.skills.length) {
+  if (status === 'error') {
+    return (
+      <EmptyState
+        icon="⚠"
+        title="Could not load your progress"
+        body="Check your connection and reload the page. Your work is safe and will appear here once your progress loads."
+      />
+    )
+  }
+
+  // The store starts from the shipped catalogue, which describes nobody. Holding
+  // here is what stops the page flashing "not assessed" before the real data lands.
+  if (status !== 'ready') {
+    return <div className="py-16 text-center text-ink-60 text-sm font-display">Loading your progress…</div>
+  }
+
+  if (!view.subjectSkills.length) {
     return (
       <EmptyState
         icon="📚"
@@ -76,262 +196,261 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <p className="text-ink-70 text-sm font-medium">
-          {greeting}{firstName ? `, ${firstName}` : ''}
-        </p>
-        <h1 className="font-display text-2xl font-bold text-ink leading-tight mt-0.5">
-          {subject.name}
-        </h1>
-        <p className="text-ink-60 text-xs font-mono-data mt-1">
-          {profile?.grade ? `Grade ${profile.grade} · ` : ''}{subject.code} · {view.skills.length} skills
-        </p>
+      {/* 1 — Welcome header */}
+      <div className="flex items-center gap-3.5">
+        <button
+          type="button"
+          onClick={() => navigate('/learner/profile')}
+          aria-label="Open your profile"
+          className="w-12 h-12 rounded-2xl bg-gradient-to-br from-sky to-blue flex items-center justify-center flex-shrink-0 pressable"
+        >
+          <span className="font-display font-bold text-ink text-base">{profile?.avatar ?? '?'}</span>
+        </button>
+        <div className="min-w-0">
+          <p className="text-ink-70 text-sm font-medium truncate">
+            {greeting}{firstName ? `, ${firstName}` : ''}
+          </p>
+          <h1 className="font-display text-2xl font-bold text-ink leading-tight truncate mt-0.5">
+            {subject.name}
+          </h1>
+          <p className="text-ink-60 text-xs font-mono-data mt-1">
+            {profile?.grade ? `Grade ${profile.grade} · ` : ''}{subject.code}
+          </p>
+        </div>
       </div>
 
-      {/* Hero */}
-      <div
-        className="relative overflow-hidden rounded-2xl border border-[#0A67B3] bg-gradient-to-br from-[#082C69] via-[#0754A6] to-[#0789D1] p-5 text-white shadow-[0_12px_32px_rgba(2,75,145,0.20)]"
-      >
-        <div className="absolute inset-0 opacity-[0.12] pointer-events-none" aria-hidden="true" style={{ backgroundImage: 'linear-gradient(135deg, transparent 48%, #68D8FF 48.2%, transparent 48.8%), linear-gradient(25deg, transparent 70%, #FFFFFF 70.2%, transparent 70.8%)' }} />
-        <p className="relative text-xs font-semibold tracking-widest uppercase font-display text-sky-200">
-          Overall Progress
-        </p>
+      {/* 2 — Your Next Step */}
+      {nextStep && (
+        <Card
+          className="p-5"
+          style={{
+            background: `linear-gradient(135deg, ${accent}1f 0%, ${accent}0a 100%)`,
+            border: `1px solid ${accent}40`,
+          }}
+        >
+          <p className="text-xs font-semibold tracking-widest uppercase font-display" style={{ color: accent }}>
+            Your Next Step
+          </p>
+          <p className="font-display text-xl font-bold text-ink mt-2 break-anywhere">{nextStep.title}</p>
+          <p className="text-ink-70 text-sm mt-1">{nextStep.topic}</p>
+          <p className="text-ink-70 text-sm mt-2 leading-relaxed">{nextStep.why}</p>
+          <div className="flex items-center gap-2 mt-3 flex-wrap">
+            <Pill color={accent}>{nextStep.activityType}</Pill>
+            <span className="text-ink-60 text-xs font-mono-data">{nextStep.duration}</span>
+          </div>
+          <Button full size="lg" className="mt-4" onClick={() => navigate(nextStep.href)}>
+            {nextStep.cta} →
+          </Button>
+        </Card>
+      )}
 
-        {now === null ? (
-          <NotAssessed what={`your ${subject.name} progress`} className="mt-3" />
-        ) : (
-          <div className="flex items-end gap-3 mt-2">
-            <span className="font-display text-5xl font-extrabold text-white leading-none">{now}%</span>
-            <div className="mb-1 flex flex-col gap-0.5">
-              <DeltaBadge baseline={base} current={now} />
-              <span className="text-white/70 text-xs">since diagnostic</span>
+      {/* 3 — Your Progress */}
+      <div>
+        <SectionLabel>Your Progress</SectionLabel>
+        <Card className="p-5">
+          <div className="grid grid-cols-2 gap-3">
+            <div className="rounded-xl bg-tint-strong border border-line-hover p-3">
+              <p className="text-ink-70 text-xs font-display">Baseline</p>
+              <div className="mt-0.5"><ScoreChip score={view.baseline} size="lg" /></div>
+            </div>
+            <div className="rounded-xl bg-tint-strong border border-line-hover p-3">
+              <p className="text-ink-70 text-xs font-display">Latest</p>
+              <div className="mt-0.5 flex items-baseline gap-2 flex-wrap">
+                <ScoreChip score={view.current} size="lg" />
+                <DeltaBadge baseline={view.baseline} current={view.current} />
+              </div>
             </div>
           </div>
-        )}
 
-        <ProgressBar
-          value={now}
-          color={level ? masteryColor(level) : accent}
-          height="h-2"
-          className="mt-3"
-        />
-        <div className="flex justify-between mt-1.5 text-xs font-mono-data text-ink-70">
-          <span className="text-white/75">
-            {view.assessed} of {view.skills.length} skills assessed
-            {base !== null && ` · baseline ${base}%`}
-          </span>
-          <span className="text-white/75">Target 80%</span>
-        </div>
+          <div className="grid grid-cols-3 gap-3 mt-3">
+            <StatTile
+              label="Assessed"
+              value={`${view.coverage.assessed}/${view.coverage.total}`}
+              sub="skills"
+              accent={accent}
+            />
+            <StatTile
+              label="Study time"
+              value={view.minutes ? `${view.minutes} min` : '—'}
+              sub="active"
+              accent="#B45309"
+            />
+            <StatTile
+              label="Sessions"
+              value={`${view.sessions}`}
+              sub="completed"
+              accent="#047857"
+            />
+          </div>
 
-        <div className="relative grid grid-cols-3 gap-3 mt-4 pt-4 border-t border-white/20">
-          <div>
-            <p className="text-white/70 text-xs font-display">Sessions</p>
-            <p className="text-white font-mono-data text-sm font-semibold">{view.subjectAttempts.length}</p>
-          </div>
-          <div>
-            <p className="text-white/70 text-xs font-display">Time</p>
-            <p className="text-white font-mono-data text-sm font-semibold">
-              {view.subjectAttempts.length ? `${view.minutes} min` : '—'}
-            </p>
-          </div>
-          <div>
-            <p className="text-white/70 text-xs font-display">Accuracy</p>
-            <p className="text-white font-mono-data text-sm font-semibold">
-              {view.accuracy === null ? '—' : `${view.accuracy}%`}
-            </p>
-          </div>
-        </div>
+          <Button
+            full
+            variant="ghost"
+            size="sm"
+            className="mt-4"
+            onClick={() => navigate('/learner/marks-map')}
+          >
+            View Full Progress →
+          </Button>
+        </Card>
       </div>
 
-      {/* Focus area — only once something has been measured */}
-      {view.weakest && view.weakest.current !== null && (
-        <Card
-          onClick={() => navigate(`/learner/practice/session/${view.weakest!.id}`)}
-          className="p-4 border-rose-500/20"
-          style={{ borderColor: 'rgba(244,63,94,0.2)', background: 'rgba(244,63,94,0.05)' }}
-        >
-          <div className="flex items-center gap-2 mb-1">
-            <span className="text-rose-400 text-xs" aria-hidden="true">⚠</span>
-            <span className="text-rose-400 text-xs font-semibold tracking-widest uppercase font-display">Focus Area</span>
-          </div>
-          <p className="font-display font-bold text-ink text-lg">{view.weakest.name}</p>
-          <div className="flex items-center gap-2 mt-1 mb-3 flex-wrap">
-            <ScoreChip score={view.weakest.current} size="sm" />
-            <span className="text-ink-60 text-xs">{view.weakest.topic}</span>
-            <DeltaBadge baseline={view.weakest.baseline} current={view.weakest.current} />
-          </div>
-          <ProgressBar
-            value={view.weakest.current}
-            color={masteryColor(getMasteryLevel(view.weakest.current)!)}
-          />
-          <div
-            className="mt-3 inline-flex items-center gap-2 text-sm font-display font-bold px-4 py-3 rounded-xl text-ink min-h-[48px]"
-            style={{ background: accent }}
-          >
-            Practise this skill →
-          </div>
-
-          <LessonLinkButton
-            skillId={view.weakest!.id}
-            className="mt-1.5"
-            label="Not sure why you keep getting it wrong? Read the lesson"
-          />
-        </Card>
-      )}
-
-      {/* Diagnostic prompt for a learner with no evidence at all */}
-      {needsDiagnostic && status === 'ready' && (
-        <NotAssessed what="any of this subject" diagnosticHref="/learner/diagnostic" />
-      )}
-
-      {/* Topics */}
+      {/* 4 — Skills to Improve */}
       <div>
-        <SectionLabel>Skills by Topic</SectionLabel>
-        <div className="grid grid-cols-2 gap-3">
-          {view.topics.map(topic => {
-            const avg = topicAverageOf(skills, activeSubjectId, topic.id)
-            const topicBase = topicAverageOf(skills, activeSubjectId, topic.id, 'baseline')
-            const topicLevel = getMasteryLevel(avg)
-            const count = view.skills.filter(s => s.topicId === topic.id).length
-            const assessedHere = view.skills.filter(s => s.topicId === topic.id && s.current !== null).length
-            return (
-              <Card
-                key={topic.id}
-                hover
-                className="p-4"
-                onClick={() => navigate('/learner/marks-map')}
-              >
-                <div className="flex items-center justify-between mb-2 gap-2">
-                  <span className="text-xs text-ink-70 font-display font-semibold truncate">{topic.name}</span>
-                  <MasteryDot level={topicLevel} />
+        <SectionLabel>Skills to Improve</SectionLabel>
+
+        {view.weak.length > 0 ? (
+          <div className="space-y-2.5">
+            {view.weak.map(skill => (
+              <Card key={skill.id} className="p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="font-display font-semibold text-ink text-sm break-anywhere">{skill.name}</p>
+                    <p className="text-ink-60 text-xs font-mono-data mt-0.5">{skill.topic}</p>
+                  </div>
+                  <MasteryBadge score={skill.current} />
                 </div>
-                <ScoreChip score={avg} size="lg" />
-                <ProgressBar value={avg} color={topicLevel ? masteryColor(topicLevel) : accent} className="mt-2" />
-                <p className="text-ink-60 text-xs mt-1 font-mono-data">
-                  {avg === null
-                    ? `${count} skill${count === 1 ? '' : 's'} · not assessed`
-                    // A topic can hold current practice without a baseline ever having
-                    // been taken, so these two are null independently. `was ${topicBase}%`
-                    // printed "was null%" for anyone who practised before diagnosing.
-                    : `${assessedHere}/${count} assessed · ${
-                      topicBase === null ? 'no baseline yet' : `was ${topicBase}%`
-                    }`}
-                </p>
-              </Card>
-            )
-          })}
-        </div>
-      </div>
-
-      {/* Next test */}
-      {view.nextQuiz && (
-        <Card onClick={() => navigate(`/learner/tests/${view.nextQuiz!.id}`)} className="p-4 flex items-center justify-between gap-3">
-          <div className="min-w-0">
-            <p className="text-ink-70 text-xs font-display uppercase tracking-widest">Next Test</p>
-            <p className="text-ink font-display font-semibold mt-0.5 truncate">{view.nextQuiz.title}</p>
-            <p className="text-ink-70 text-xs mt-0.5 font-mono-data">
-              {view.nextQuiz.questionIds.length} questions
-              {view.nextQuiz.timeLimitMin ? ` · ${view.nextQuiz.timeLimitMin} min` : ' · untimed'}
-            </p>
-          </div>
-          <span
-            className="w-11 h-11 rounded-full flex items-center justify-center text-ink font-bold text-lg flex-shrink-0"
-            style={{ background: accent }}
-            aria-hidden="true"
-          >
-            →
-          </span>
-        </Card>
-      )}
-
-      {/* Quick stats */}
-      <div className="grid grid-cols-3 gap-3">
-        <StatTile
-          label="Streak"
-          value={profile?.streak ? `${profile.streak} days` : '—'}
-          sub={profile?.streak ? 'keep going' : 'no sessions yet'}
-          accent="#B45309"
-        />
-        <StatTile
-          label="Strongest"
-          value={view.strongestTopic ? `${view.strongestTopic.average}%` : '—'}
-          sub={view.strongestTopic?.name ?? 'not assessed'}
-          accent="#047857"
-        />
-        <StatTile
-          label="Bank"
-          value={`${view.questions.length}`}
-          sub="questions"
-          accent={accent}
-        />
-      </div>
-
-      {/* Resources */}
-      {view.subjectResources.length > 0 && (
-        <div>
-          <SectionLabel>Your Files</SectionLabel>
-          <div className="space-y-2">
-            {view.subjectResources.slice(0, 3).map(resource => (
-              <Card key={resource.id} hover className="p-3.5 flex items-center gap-3" onClick={() => navigate('/learner/library')}>
-                <Pill color={accent}>{resource.kind.replace('-', ' ')}</Pill>
-                <span className="text-ink text-sm font-display truncate flex-1 min-w-0">{resource.title}</span>
-                <span className="text-ink-60 text-xs font-mono-data flex-shrink-0">
-                  {Math.round(resource.size / 1024)} KB
-                </span>
+                <div className="flex items-center gap-2 mt-2.5">
+                  <ProgressBar
+                    value={skill.current}
+                    color={masteryColor(getMasteryLevel(skill.current))}
+                    className="flex-1"
+                  />
+                  <ScoreChip score={skill.current} size="xs" />
+                </div>
+                <Button
+                  full
+                  size="sm"
+                  className="mt-3"
+                  onClick={() => navigate(`/learner/practice/session/${skill.id}`)}
+                >
+                  Practise this skill →
+                </Button>
+                <LessonLinkButton skillId={skill.id} className="mt-1.5" label="Read the lesson" />
               </Card>
             ))}
           </div>
-        </div>
-      )}
+        ) : (
+          <Card className="p-4">
+            <p className="text-ink-70 text-sm leading-relaxed">
+              No weak skills have been measured in {subject.name} yet.
+            </p>
+          </Card>
+        )}
 
-      {/* Recent activity */}
-      {view.subjectAttempts.length > 0 && (
-        <div>
-          <SectionLabel>Recent Activity</SectionLabel>
+        {/* Unassessed skills are kept apart: no evidence is not the same as weak. */}
+        {view.unassessed.length > 0 && (
+          <Card className="p-4 mt-3">
+            <div className="flex items-center gap-2">
+              <span
+                className="inline-block w-2 h-2 rounded-full border border-dashed border-line-strong flex-shrink-0"
+                aria-hidden="true"
+              />
+              <p className="font-display font-semibold text-ink text-sm">
+                {view.unassessed.length} skill{view.unassessed.length === 1 ? '' : 's'} not yet assessed
+              </p>
+            </div>
+            <p className="text-ink-70 text-xs mt-1.5 leading-relaxed">
+              These have no assessment evidence, so they are listed separately rather than assumed
+              to be weak. A diagnostic is what turns them into a measured score.
+            </p>
+            <Button
+              full
+              variant="ghost"
+              size="sm"
+              className="mt-3"
+              onClick={() => navigate('/learner/tests')}
+            >
+              Take a diagnostic →
+            </Button>
+          </Card>
+        )}
+      </div>
+
+      {/* 5 — Today's Study Plan */}
+      <div>
+        <SectionLabel>Today&rsquo;s Study Plan</SectionLabel>
+
+        {view.plan.length > 0 ? (
           <div className="space-y-2">
-            {view.subjectAttempts.slice(0, 5).map(attempt => {
-              const pct = Math.round((attempt.correct / attempt.total) * 100)
-              const attemptLevel = getMasteryLevel(pct)
-              // A skill drill records its attempt against `skill-<skillId>`, which is
-              // not a quiz. Sending that to /learner/tests landed on "Test not found",
-              // so a learner who drilled a weak skill could not get back to it from
-              // their own history.
-              const drill = isSkillDrillId(attempt.quizId)
-              const target = drill
-                ? `/learner/practice/session/${attempt.quizId.slice('skill-'.length)}`
-                : `/learner/tests/${attempt.quizId}`
+            {view.plan.map(item => {
+              const style = PLAN_STYLE[item.type]
+              const skillName = skills.find(s => s.id === item.skillId)?.name
               return (
-                <Card
-                  key={attempt.id}
-                  hover
-                  className="p-3 flex items-center gap-3"
-                  onClick={() => navigate(target)}
-                >
-                  <span
-                    className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 text-xs font-mono-data font-bold"
-                    style={{ background: `${masteryColor(attemptLevel!)}18`, color: masteryColor(attemptLevel!) }}
-                  >
-                    {pct}%
-                  </span>
-                  <span className="flex-1 min-w-0">
-                    <span className="block text-ink text-sm font-display font-semibold truncate">{attempt.quizTitle}</span>
-                    <span className="block text-ink-60 text-xs font-mono-data">
-                      {attempt.correct}/{attempt.total} correct · {attempt.durationMin} min
-                      {drill && ' · skill drill'}
+                <Card key={item.id} className="p-4">
+                  <div className="flex items-center gap-3">
+                    <span
+                      className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
+                      style={{ background: style.bg, color: style.color }}
+                      aria-hidden="true"
+                    >
+                      {style.glyph}
                     </span>
-                  </span>
-                  <span className="text-ink-60 text-xs font-mono-data flex-shrink-0">{attempt.date.slice(5)}</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-display font-semibold text-ink text-sm truncate">
+                        {skillName ?? item.topic}
+                      </p>
+                      <p className="text-ink-60 text-xs font-mono-data mt-0.5 truncate">
+                        {style.label} · {item.durationMin} min · {item.day} {item.date}
+                      </p>
+                    </div>
+                    <Pill color={item.complete ? '#047857' : '#6b7280'}>
+                      {item.complete ? 'Complete' : 'Not started'}
+                    </Pill>
+                  </div>
+                  {!item.complete && (
+                    <button
+                      type="button"
+                      onClick={() => navigate(planTarget(item))}
+                      className="mt-2.5 -ml-1 px-1 text-xs font-display min-h-[36px] pressable"
+                      style={{ color: accent }}
+                    >
+                      Start this activity →
+                    </button>
+                  )}
                 </Card>
               )
             })}
           </div>
-        </div>
-      )}
+        ) : (
+          <EmptyState
+            icon="◷"
+            title="Nothing planned yet"
+            body={view.coverage.assessed === 0
+              ? `A study plan is built from your assessed skills. Take the ${subject.name} diagnostic and it will fill in.`
+              : `Nothing is scheduled for ${subject.name} right now. Practise a skill and the plan rebuilds around it.`}
+          />
+        )}
+      </div>
 
-      {level && (
-        <p className="text-center text-ink-60 text-xs font-display">
-          {level === 'mastered' ? 'Mastered' : level === 'developing' ? 'Developing' : level === 'weak' ? 'Weak' : 'Major gap'} in {subject.name} · {subject.pairing}
-        </p>
+      {/* 6 — Continue Learning */}
+      {view.session && (
+        <div>
+          <SectionLabel>Continue Learning</SectionLabel>
+          <Card className="p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="font-display font-bold text-ink text-sm break-anywhere">
+                  {view.session.quizTitle}
+                </p>
+                <p className="text-ink-60 text-xs font-mono-data mt-0.5">
+                  {KIND_LABEL[view.session.kind]} · Question{' '}
+                  {Math.min(view.session.index + 1, view.session.questionIds.length)} of{' '}
+                  {view.session.questionIds.length}
+                </p>
+              </div>
+              <Pill color={accent}>{SUBJECT_MAP[view.session.subjectId].shortName}</Pill>
+            </div>
+            <ProgressBar
+              value={((view.session.index + 1) / view.session.questionIds.length) * 100}
+              color={accent}
+              className="mt-3"
+            />
+            <Button full size="lg" className="mt-3" onClick={() => navigate(resumePath(view.session!))}>
+              Resume →
+            </Button>
+          </Card>
+        </div>
       )}
     </div>
   )

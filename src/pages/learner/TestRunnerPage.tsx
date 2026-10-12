@@ -2,6 +2,8 @@ import { useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { SUBJECT_MAP, totalMarksOf, topicName, type AssessmentKind, type Question } from '@/data'
 import { useAppStore } from '@/store/AppStore'
+import { useAuth } from '@/store/AuthStore'
+import { readSession, sessionMatches } from '@/lib/session'
 import QuizRunner from '@/components/quiz/QuizRunner'
 import { Button, EmptyState, Pill } from '@/components/ui'
 
@@ -46,7 +48,23 @@ export default function TestRunnerPage() {
   const { quizId } = useParams<{ quizId: string }>()
   const navigate = useNavigate()
   const { quizzes, questions, attempts } = useAppStore()
-  const [phase, setPhase] = useState<Phase>('brief')
+  const { user } = useAuth()
+
+  const quiz = quizzes.find(q => q.id === quizId)
+
+  const ordered = useMemo<Question[]>(() => {
+    if (!quiz) return []
+    const byId = new Map(questions.map(q => [q.id, q]))
+    return quiz.questionIds.map(id => byId.get(id)).filter((q): q is Question => Boolean(q))
+  }, [quiz, questions])
+
+  // A learner returning to a quiz they left mid-sitting goes straight back into
+  // the runner; the briefing would only offer to start the paper over.
+  const [phase, setPhase] = useState<Phase>(() =>
+    sessionMatches(readSession(user?.uid ?? null), quizId ?? '', ordered.map(q => q.id))
+      ? 'running'
+      : 'brief',
+  )
   // Bumped by "Sit it again". The runner keeps a `finished` ref that suppresses a
   // second submit, so re-running the same quiz needs a fresh instance; navigating
   // back to this identical URL would not remount anything.
@@ -56,14 +74,6 @@ export default function TestRunnerPage() {
     setRun(n => n + 1)
     setPhase('running')
   }
-
-  const quiz = quizzes.find(q => q.id === quizId)
-
-  const ordered = useMemo<Question[]>(() => {
-    if (!quiz) return []
-    const byId = new Map(questions.map(q => [q.id, q]))
-    return quiz.questionIds.map(id => byId.get(id)).filter((q): q is Question => Boolean(q))
-  }, [quiz, questions])
 
   const history = useMemo(
     () => attempts.filter(a => a.quizId === quizId).slice(0, 5),
